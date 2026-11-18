@@ -52,17 +52,22 @@ export interface CreateMcpHonoAppOptions {
     maxRequestBodySize?: number;
 }
 
+type ParsedJsonBody = { kind: 'too-large' } | { kind: 'empty' } | { kind: 'parsed'; value: unknown };
+
 /**
  * Reads (bounded, via the transport's own reader) and parses a JSON body from a
  * clone of the request, so the original stream stays readable. Returning only the
  * parsed value keeps the decoded text from outliving the parse.
  */
-async function parseJsonBody(request: Request, maxBytes: number): Promise<{ tooLarge: true } | { tooLarge: false; value: unknown }> {
+async function parseJsonBody(request: Request, maxBytes: number): Promise<ParsedJsonBody> {
     const body = await readRequestBody(request, maxBytes);
     if (body.tooLarge) {
-        return { tooLarge: true };
+        return { kind: 'too-large' };
     }
-    return { tooLarge: false, value: JSON.parse(body.text) };
+    if (body.text.length === 0) {
+        return { kind: 'empty' };
+    }
+    return { kind: 'parsed', value: JSON.parse(body.text) };
 }
 
 /**
@@ -125,6 +130,11 @@ export function createMcpHonoApp(options: CreateMcpHonoAppOptions = {}): Hono {
             return await next();
         }
 
+        const method = c.req.method.toUpperCase();
+        if (method === 'GET' || method === 'HEAD') {
+            return await next();
+        }
+
         // Parsed media type, never a substring match — see isJsonContentType.
         // A body left unparsed here is answered 415 by the transport's own
         // Content-Type check downstream.
@@ -135,7 +145,7 @@ export function createMcpHonoApp(options: CreateMcpHonoAppOptions = {}): Hono {
         try {
             // Parse from a clone so we don't consume the original request stream.
             const parsed = await parseJsonBody(c.req.raw.clone(), maxRequestBodySize);
-            if (parsed.tooLarge) {
+            if (parsed.kind === 'too-large') {
                 return c.json(
                     {
                         jsonrpc: '2.0',
@@ -145,7 +155,9 @@ export function createMcpHonoApp(options: CreateMcpHonoAppOptions = {}): Hono {
                     413
                 );
             }
-            c.set('parsedBody', parsed.value);
+            if (parsed.kind === 'parsed') {
+                c.set('parsedBody', parsed.value);
+            }
         } catch {
             // Mirror express.json() behavior loosely: reject invalid JSON.
             return c.text('Invalid JSON', 400);

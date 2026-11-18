@@ -1,3 +1,4 @@
+import { createMcpHandler, McpServer, WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/server';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { vi } from 'vitest';
@@ -88,6 +89,102 @@ describe('@modelcontextprotocol/hono', () => {
         });
         expect(res.status).toBe(400);
         expect(await res.text()).toBe('Invalid JSON');
+    });
+
+    test('createMcpHonoApp skips JSON parsing for GET, HEAD, and empty-body requests with application/json', async () => {
+        const app = createMcpHonoApp();
+        app.all('/mcp', (c: Context) =>
+            c.json({
+                method: c.req.method,
+                hasParsedBody: c.get('parsedBody') !== undefined
+            })
+        );
+
+        for (const method of ['GET', 'DELETE', 'OPTIONS', 'POST']) {
+            const res = await app.request('http://localhost/mcp', {
+                method,
+                headers: { Host: 'localhost:3000', 'content-type': 'application/json' }
+            });
+            expect(res.status).toBe(200);
+            expect(await res.json()).toEqual({ method, hasParsedBody: false });
+        }
+
+        const head = await app.request('http://localhost/mcp', {
+            method: 'HEAD',
+            headers: { Host: 'localhost:3000', 'content-type': 'application/json' }
+        });
+        expect(head.status).toBe(200);
+
+        const whitespace = await app.request('http://localhost/mcp', {
+            method: 'POST',
+            headers: { Host: 'localhost:3000', 'content-type': 'application/json' },
+            body: '   '
+        });
+        expect(whitespace.status).toBe(400);
+        expect(await whitespace.text()).toBe('Invalid JSON');
+    });
+
+    test('createMcpHonoApp forwards bodyless application/json requests to MCP handlers and session transports', async () => {
+        const entryApp = createMcpHonoApp();
+        const handler = createMcpHandler(() => new McpServer({ name: 's', version: '1.0.0' }));
+        entryApp.all('/mcp', (c: Context) => handler.fetch(c.req.raw, { parsedBody: c.get('parsedBody') }));
+
+        const getRes = await entryApp.request('http://localhost/mcp', {
+            method: 'GET',
+            headers: { Host: 'localhost:3000', 'content-type': 'application/json' }
+        });
+        expect(getRes.status).toBe(405);
+        expect(getRes.headers.get('allow')).toBe('POST');
+
+        const emptyPost = await entryApp.request('http://localhost/mcp', {
+            method: 'POST',
+            headers: {
+                Host: 'localhost:3000',
+                'content-type': 'application/json',
+                accept: 'application/json, text/event-stream'
+            }
+        });
+        expect(emptyPost.status).toBe(400);
+        expect((await emptyPost.json()) as { error: { code: number } }).toMatchObject({
+            jsonrpc: '2.0',
+            error: { code: -32_700 },
+            id: null
+        });
+        await handler.close();
+
+        const sessionApp = createMcpHonoApp();
+        const server = new McpServer({ name: 's', version: '1.0.0' });
+        const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: () => 'sess-1' });
+        await server.connect(transport);
+        sessionApp.all('/mcp', (c: Context) => transport.handleRequest(c.req.raw, { parsedBody: c.get('parsedBody') }));
+
+        const initRes = await sessionApp.request('http://localhost/mcp', {
+            method: 'POST',
+            headers: {
+                Host: 'localhost:3000',
+                'content-type': 'application/json',
+                accept: 'application/json, text/event-stream'
+            },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'initialize',
+                params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'c', version: '1.0.0' } }
+            })
+        });
+        expect(initRes.status).toBe(200);
+        await initRes.body?.cancel();
+
+        const deleteRes = await sessionApp.request('http://localhost/mcp', {
+            method: 'DELETE',
+            headers: {
+                Host: 'localhost:3000',
+                'content-type': 'application/json',
+                'mcp-session-id': 'sess-1'
+            }
+        });
+        expect(deleteRes.status).toBe(200);
+        await server.close();
     });
 
     test('createMcpHonoApp does not parse a non-JSON media type whose parameters contain application/json', async () => {
